@@ -112,7 +112,7 @@ def insert_battery_summaries(cur, battery_id, summary_data):
         logger.error(f"Error inserting battery summary data: {e}")
         raise
 
-def insert_cycles_interpolated(cur, battery_id, cycles_data):
+def insert_cycles_interpolated(cur, battery_id, cycles_data, file_size_mb=0):
     """Insert battery cycles interpolated data into the battery_cycles_interpolated table."""
     try:
         if not cycles_data:
@@ -148,10 +148,37 @@ def insert_cycles_interpolated(cur, battery_id, cycles_data):
             else:
                 logger.warning(f"No valid cycle_index array found, will use default cycle_index=0")
             
-            # Process each data point
-            # To avoid inserting too many rows, let's sample the data (e.g., every 10th point)
-            sample_rate = 10
+            # Determine appropriate sample rate based on data size and file size
+            # For very large datasets or files, use a much higher sample rate
+            sample_rate = 10  # Default sample rate
+            
+            # Adjust based on data array length
+            if data_length > 500000:
+                sample_rate = 50
+            elif data_length > 1000000:
+                sample_rate = 100
+            elif data_length > 4000000:
+                sample_rate = 200
+                
+            # Further adjust based on file size if it's large
+            if file_size_mb > 200:
+                sample_rate = max(sample_rate * 2, 100)  # Double the sample rate for large files, minimum 1:100
+            elif file_size_mb > 150:
+                sample_rate = max(sample_rate * 1.5, 50)  # Increase by 50% for medium-large files
+            
+            logger.info(f"Using sample rate of 1:{sample_rate} for dataset with {data_length} points")
+            
+            # Safely get values from arrays with bounds checking
+            def safe_get(key, index, default=None):
+                if key in cycles_data and cycles_data[key] and index < len(cycles_data[key]):
+                    return cycles_data[key][index]
+                return default
+            
+            # Use batch inserts for better performance
+            batch_size = 1000
             inserted_count = 0
+            batch_data = []
+            
             for i in range(0, data_length, sample_rate):
                 if i >= data_length:
                     break
@@ -165,12 +192,6 @@ def insert_cycles_interpolated(cur, battery_id, cycles_data):
                         # If conversion fails, use default
                         pass
                 
-                # Safely get values from arrays with bounds checking
-                def safe_get(key, index, default=None):
-                    if key in cycles_data and cycles_data[key] and index < len(cycles_data[key]):
-                        return cycles_data[key][index]
-                    return default
-                
                 time = safe_get('time', i)
                 voltage = safe_get('voltage', i)
                 current = safe_get('current', i)
@@ -182,23 +203,53 @@ def insert_cycles_interpolated(cur, battery_id, cycles_data):
                 if all(v is None for v in [time, voltage, current, temperature, charge_capacity, discharge_capacity]):
                     continue
                 
-                # Insert into battery_cycles_interpolated table
+                # Add to batch
+                batch_data.append((battery_id, cycle_idx, time, voltage, current, temperature, charge_capacity, discharge_capacity))
+                
+                # Execute batch insert when batch is full
+                if len(batch_data) >= batch_size:
+                    try:
+                        # Use executemany for batch insert
+                        cur.executemany(
+                            """
+                            INSERT INTO battery_cycles_interpolated (
+                                battery_id, cycle_index, time, voltage, current_, 
+                                temperature, charge_capacity, discharge_capacity
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            batch_data
+                        )
+                        # Commit each batch immediately to save progress
+                        conn = cur.connection
+                        conn.commit()
+                        inserted_count += len(batch_data)
+                        logger.info(f"Inserted and committed batch of {len(batch_data)} points, total {inserted_count} so far")
+                        batch_data = []  # Clear batch after insertion
+                    except Exception as e:
+                        logger.error(f"Error inserting batch: {e}")
+                        # Continue with next batch even if this one fails
+                        batch_data = []
+            
+            # Insert any remaining data points
+            if batch_data:
                 try:
-                    cur.execute(
+                    cur.executemany(
                         """
                         INSERT INTO battery_cycles_interpolated (
                             battery_id, cycle_index, time, voltage, current_, 
                             temperature, charge_capacity, discharge_capacity
                         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                         """,
-                        (
-                            battery_id, cycle_idx, time, voltage, current, 
-                            temperature, charge_capacity, discharge_capacity
-                        )
+                        batch_data
                     )
-                    inserted_count += 1
+                    # Commit the final batch immediately
+                    conn = cur.connection
+                    conn.commit()
+                    inserted_count += len(batch_data)
+                    logger.info(f"Inserted and committed final batch of {len(batch_data)} points, total {inserted_count}")
                 except Exception as e:
-                    logger.error(f"Error inserting cycle data point: {e}")
+                    logger.error(f"Error inserting final batch: {e}")
+
             
             logger.info(f"Inserted {inserted_count} data points for battery ID {battery_id} in flattened format")
         else:
@@ -295,11 +346,21 @@ def process_file(conn, file_path):
     cur = None
     
     try:
-        logger.info(f"Processing file: {file_path}")
+        # Check file size first
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)  # Convert to MB
+        logger.info(f"Processing file: {file_path} (Size: {file_size_mb:.2f} MB)")
         
-        # Load JSON data
-        with open(file_path, 'r') as f:
-            data = json.load(f)
+        # For very large files, use a more aggressive sampling rate
+        if file_size_mb > 200:
+            logger.info(f"Large file detected ({file_size_mb:.2f} MB). Using more aggressive sampling.")
+        
+        # Load JSON data with a memory-efficient approach for large files
+        try:
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing JSON file {file_path}: {e}")
+            return
         
         # Always set autocommit to True before creating a cursor
         # This ensures we're not in a transaction when setting session parameters
@@ -320,23 +381,26 @@ def process_file(conn, file_path):
         cur.close()
         cur = None
         
-        # Start a new transaction
+        # Start a new transaction for battery and summary data
         conn.autocommit = False
         cur = conn.cursor()
         
-        # Insert battery data and get battery ID
         battery_id = insert_battery(cur, data)
         
-        # Insert summary data if available
+        # Commit the battery insertion immediately
+        conn.commit()
+        logger.info(f"Committed battery data with ID {battery_id}")
+        
         if 'summary' in data:
             insert_battery_summaries(cur, battery_id, data['summary'])
+            # Commit the summary data immediately
+            conn.commit()
+            logger.info(f"Committed summary data for battery ID {battery_id}")
         
         # Insert cycles interpolated data if available
+        # (This will handle its own commits in smaller batches)
         if 'cycles_interpolated' in data:
-            insert_cycles_interpolated(cur, battery_id, data['cycles_interpolated'])
-        
-        # Commit transaction
-        conn.commit()
+            insert_cycles_interpolated(cur, battery_id, data['cycles_interpolated'], file_size_mb)
         logger.info(f"Successfully ingested data from {file_path}")
         
     except Exception as e:
@@ -350,10 +414,21 @@ def process_file(conn, file_path):
     finally:
         # Reset autocommit and close cursor
         try:
-            if conn and not conn.closed:
-                conn.autocommit = True
+            # First close the cursor if it's still open
             if cur is not None and not cur.closed:
                 cur.close()
+                cur = None
+                
+            # Then handle the connection - make sure we're not in a transaction
+            if conn and not conn.closed:
+                # If we're in a transaction, roll it back before setting autocommit
+                if not conn.autocommit:
+                    try:
+                        conn.rollback()
+                    except Exception as rollback_error:
+                        logger.error(f"Error during final rollback: {rollback_error}")
+                # Now it's safe to set autocommit
+                conn.autocommit = True
         except Exception as cleanup_error:
             logger.error(f"Error during cleanup: {cleanup_error}")
 
@@ -363,36 +438,68 @@ def ingest_data(folder_path=None):
     # Load environment variables first to ensure we have access to FOLDER_DATA
     load_dotenv('.env')
     
+    # Get folder path from environment variable if not provided
     if folder_path is None:
         folder_path = os.getenv('FOLDER_DATA', '/home/rangdong/DataBattery')
     
     logger.info(f"Using data folder: {folder_path}")
     
+    # Find all JSON files in the folder
+    json_files = glob.glob(os.path.join(folder_path, "*.json"))
+    logger.info(f"Found {len(json_files)} JSON files to process")
+    
+    # Track processed files to avoid reprocessing on restart
+    processed_files_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'processed_files.txt')
+    processed_files = set()
+    
+    # Load previously processed files if the file exists
+    if os.path.exists(processed_files_path):
+        try:
+            with open(processed_files_path, 'r') as f:
+                processed_files = set(line.strip() for line in f if line.strip())
+            logger.info(f"Loaded {len(processed_files)} previously processed files")
+        except Exception as e:
+            logger.error(f"Error loading processed files list: {e}")
+    
+    # Connect to the database
     conn = None
     try:
-        # Connect to the database
         conn = connect_to_db()
-        
-        # Check if the folder exists
-        if not os.path.exists(folder_path):
-            logger.error(f"Folder path does not exist: {folder_path}")
-            return
-            
-        # Get list of JSON files
-        json_files = glob.glob(os.path.join(folder_path, '*.json'))
-        logger.info(f"Found {len(json_files)} JSON files to process")
         
         # Process each file
         for file_path in json_files:
-            process_file(conn, file_path)
+            # Skip already processed files
+            file_basename = os.path.basename(file_path)
+            if file_basename in processed_files:
+                logger.info(f"Skipping already processed file: {file_basename}")
+                continue
+                
+            try:
+                process_file(conn, file_path)
+                
+                # Mark file as processed
+                processed_files.add(file_basename)
+                try:
+                    with open(processed_files_path, 'a') as f:
+                        f.write(file_basename + '\n')
+                except Exception as e:
+                    logger.error(f"Error updating processed files list: {e}")
+                    
+            except KeyboardInterrupt:
+                logger.warning("Process interrupted by user. Saving progress...")
+                break
+            except Exception as e:
+                logger.error(f"Error processing file {file_path}: {e}")
+                # Continue with next file
             
+        logger.info("Data ingestion process completed")
+    except KeyboardInterrupt:
+        logger.warning("Process interrupted by user. Progress has been saved.")
     except Exception as e:
         logger.error(f"Error in data ingestion process: {e}")
     finally:
-        # Close database connection
         if conn:
             conn.close()
-        logger.info("Data ingestion process completed")
 
 if __name__ == "__main__":
     # Parse command line arguments
